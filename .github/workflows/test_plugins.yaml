@@ -2,16 +2,19 @@ name: Test plugins
 
 env:
   spack_version: v1.0.0-alpha.2
-  esmf_version: develop
-  compiler_version: latest
+  esmf_version: 8.8.0
+  conduit_version: 0.9.2
+  paraview_version: 5.13.1
+  paraview_headless_type: osmesa  
+  compiler_version: 12.3.0
   install_dir: ${{ github.workspace }}/app
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
-    branches: [ main ]
+    branches: [ main, feature/cicd ]
+  #pull_request:
+  #  types: [opened, synchronize, reopened, labeled, unlabeled]
+  #  branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -21,10 +24,14 @@ jobs:
     - name: Install Core Development Tools
       run: |
         sudo apt-get -qq update
-        sudo apt-get -qq install wget tar unzip file gringo
-        sudo apt-get -qq install build-essential binutils-dev gfortran
-        sudo apt-get -qq install python3-dev python3-pip python3-yaml
-        sudo apt-get -qq install tcl tcl-dev
+        sudo apt-get -qq install \
+          wget tar unzip file gringo llvm meson \
+          build-essential binutils-dev gfortran \
+          python3-dev python3-pip python3-yaml \
+          curl libcurl4-openssl-dev tcl tcl-dev \
+          libosmesa6-dev libegl1-mesa-dev mesa-utils
+        
+        ls /usr/bin/llvm-config
       shell: bash
 
     - name: Checkout Component Repository
@@ -32,45 +39,113 @@ jobs:
       with:
         path: ${{ env.install_dir }}/geogate
 
-    - name: Install Lua and Lmod
-      run: |
-        LUA_VERSION=5.1.4.9
-        LMOD_VERSION=8.7
-        mkdir ${{ env.install_dir }}/progs
-        cd ${{ env.install_dir }}/progs
-        wget -c https://sourceforge.net/projects/lmod/files/lua-${LUA_VERSION}.tar.bz2
-        tar -xvf lua-${LUA_VERSION}.tar.bz2
-        rm -rf lua-${LUA_VERSION}.tar.bz2
-        cd lua-${LUA_VERSION}
-        ./configure --prefix=${PWD}/install
-        make
-        make install
-        export LUA_ROOT=${PWD}/install
-        cd ..
-        wget -c https://sourceforge.net/projects/lmod/files/Lmod-${LMOD_VERSION}.tar.bz2
-        tar -xvf Lmod-${LMOD_VERSION}.tar.bz2
-        rm -rf Lmod-${LMOD_VERSION}.tar.bz2
-        cd Lmod-${LMOD_VERSION}
-        ./configure --prefix=${PWD}/install --with-lua=${LUA_ROOT}/bin/lua \
-            --with-luac=${LUA_ROOT}/bin/luac --with-lua_include=${LUA_ROOT}/include
-        make
-        make install
-        export LMOD_ROOT=${PWD}/install
-        cd ..
-        source ${LMOD_ROOT}/lmod/${LMOD_VERSION}/init/profile
-        sudo ln -sf ${LMOD_ROOT}/lmod/${LMOD_VERSION}/init/profile /etc/profile.d/lmod.sh
-        module -v
+    - name: Restore Cached Dependencies
+      id: restore-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ env.install_dir }}/spack
+        key: |
+          spack-${{ runner.os }}-gcc_${{ env.compiler_version }}-esmf_${{ env.esmf_version }}-conduit_${{ env.conduit_version }}-paraview_${{ env.paraview_version }}_${{ env.paraview_headless_type }}
 
     - name: Create Spack Environment and Install Dependencies
+      if: steps.restore-cache.outputs.cache-hit != 'true'
       run: |
+        echo "steps.restore-cache.outputs.cache-hit = ${{ steps.restore-cache.outputs.cache-hit }}"
         ${{ env.install_dir }}/geogate/.github/workflows/scripts/install_deps.sh \
           -i ${{ env.install_dir }}
       shell: bash
 
-    - name: Restore Dependencies
-      uses: actions/cache@v4
+    - name: Save Dependencies to Cache
+      id: save-cache
+      if: steps.restore-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
       with:
         path: ${{ env.install_dir }}/spack
-        key: spack-${{ runner.os }}-${{ inputs.architecture }}-${{ hashFiles('**/spack.lock') }}
-        restore-keys: |
-          spack-${{ runner.os }}-${{ inputs.architecture }}-${{ hashFiles('**/spack.lock') }}
+        key: |
+          spack-${{ runner.os }}-gcc_${{ env.compiler_version }}-esmf_${{ env.esmf_version }}-conduit_${{ env.conduit_version }}-paraview_${{ env.paraview_version }}_${{ env.paraview_headless_type }}
+
+    - name: Checkout CDEPS Data Components
+      uses: actions/checkout@v4
+      with:
+        repository: ESCOMP/CDEPS
+        path: ${{ env.install_dir }}/cdeps
+        submodules: true
+
+    - name: Install CDEPS
+      run: |
+        cd ${{ env.install_dir }}
+        . spack/share/spack/setup-env.sh
+        . $(spack location -i lmod)/lmod/lmod/init/bash
+        module load esmf
+        export FC=gfortran
+        cd ${{ env.install_dir }}/cdeps
+        mkdir build
+        cd build
+        cmake -DCMAKE_INSTALL_PREFIX=${{ env.install_dir }}/cdeps/install \
+          -DPIO_C_LIBRARY=$parallelio_ROOT/lib \
+          -DPIO_C_INCLUDE_DIR=$parallelio_ROOT/include \
+          -DPIO_Fortran_LIBRARY=$parallelio_ROOT/lib \
+          -DPIO_Fortran_INCLUDE_DIR=$parallelio_ROOT/include \
+          -DCMAKE_Fortran_FLAGS="-DCPRGNU -ffree-form -ffree-line-length-none -fallow-argument-mismatch" \
+          -DDISABLE_FoX=ON ../
+        make
+        make install
+      shell: bash
+
+    - name: Install GeoGate
+      run: |
+        cd ${{ env.install_dir }}
+        . spack/share/spack/setup-env.sh
+        . $(spack location -i lmod)/lmod/lmod/init/bash
+        module load esmf
+        module load libcatalyst
+        module load conduit
+        export FC=gfortran
+        cd ${{ env.install_dir }}/geogate
+        mkdir build
+        cd build
+        cmake -DCMAKE_INSTALL_PREFIX=${{ env.install_dir }}/geogate/install \
+           -DGEOGATE_USE_PYTHON=ON \
+           -DGEOGATE_USE_CATALYST=ON \
+           -DCMAKE_Fortran_FLAGS="-ffree-form -ffree-line-length-none" \
+           ../src/
+        make
+        make install
+      shell: bash
+
+    - name: Create Executable with ESMX
+      run: |
+        cd ${{ env.install_dir }}
+        . spack/share/spack/setup-env.sh
+        . $(spack location -i lmod)/lmod/lmod/init/bash
+        module load esmf
+        module load libcatalyst
+        module load conduit
+        echo "application:" > esmxBuild.yaml 
+        echo "  disable_comps: ESMX_Data" >> esmxBuild.yaml
+        echo "  link_libraries: piof conduit catalyst catalyst_fortran python3.11" >> esmxBuild.yaml
+        python_static_lib=`python ${{ env.install_dir }}/geogate/.github/workflows/scripts/find_python.py | awk -F: '{print $2}' | tr -d ' '`  
+        echo "  link_paths: $python_static_lib" >> esmxBuild.yaml
+        echo "components:" >> esmxBuild.yaml
+        echo "  datm:" >> esmxBuild.yaml
+        echo "    build_type: none" >> esmxBuild.yaml
+        echo "    install_prefix: ${{ env.install_dir }}/cdeps/install" >> esmxBuild.yaml
+        echo "    libraries: datm dshr streams cdeps_share" >> esmxBuild.yaml
+        echo "    fort_module: cdeps_datm_comp.mod" >> esmxBuild.yaml
+        echo "  docn:" >> esmxBuild.yaml
+        echo "    build_type: none" >> esmxBuild.yaml
+        echo "    install_prefix: ${{ env.install_dir }}/cdeps/install" >> esmxBuild.yaml
+        echo "    libraries: docn dshr streams cdeps_share" >> esmxBuild.yaml
+        echo "    fort_module: cdeps_docn_comp.mod" >> esmxBuild.yaml
+        echo "  geogate:" >> esmxBuild.yaml
+        echo "    build_type: none" >> esmxBuild.yaml
+        echo "    install_prefix: ${{ env.install_dir }}/geogate/install" >> esmxBuild.yaml
+        echo "    libraries: geogate geogate_io geogate_python geogate_catalyst geogate_shared" >> esmxBuild.yaml
+        echo "    fort_module: geogate_nuopc.mod" >> esmxBuild.yaml
+        echo "::group::Content of esmxBuild.yaml"
+        cat esmxBuild.yaml
+        echo "::endgroup::"
+        echo "::group::Build Application"
+        ESMX_Builder -v
+        echo "::endgroup::"
+      shell: bash
